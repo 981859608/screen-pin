@@ -16,6 +16,11 @@ enum Config {
     static let minZoom: CGFloat = 0.08
     /// 帧率只给这几个档位：小于 15 明显卡顿，大于 120 采集端也不会有更多帧。
     static let fpsChoices: [Int32] = [15, 24, 30, 60, 120]
+    /// 框选矩形的最小边长，也是"这算不算一次有效框选"的门槛；再小就误触了。
+    static let minSelectionSide: CGFloat = 12
+    static let handleSize: CGFloat = 6
+    /// 手柄的命中半径比画出来的方块大一圈，不然很难点中。
+    static let handleHit: CGFloat = 9
 }
 
 /// 用户可改的偏好，直接落在 UserDefaults 上。键名改了老用户的设置会丢，所以别动。
@@ -71,6 +76,16 @@ enum Geo {
             .map { ($0.frame.intersection(rect).width * $0.frame.intersection(rect).height, $0) }
             .max { $0.0 < $1.0 }?.1 ?? NSScreen.main
     }
+
+    /// 把矩形整体平移回 visible 内；比可见区还大就居中。只平移，不动尺寸。
+    static func clamp(_ rect: CGRect, into visible: CGRect) -> CGRect {
+        var out = rect
+        out.origin.x = out.width <= visible.width ? min(max(out.minX, visible.minX), visible.maxX - out.width)
+                                                 : visible.midX - out.width / 2
+        out.origin.y = out.height <= visible.height ? min(max(out.minY, visible.minY), visible.maxY - out.height)
+                                                   : visible.midY - out.height / 2
+        return out
+    }
 }
 
 // MARK: - 命中选区中心的窗口
@@ -83,7 +98,7 @@ struct Target {
 
     func resolved(with window: SCWindow) -> Target? {
         let crop = self.crop.intersection(CGRect(origin: .zero, size: window.frame.size))
-        guard crop.width >= 12, crop.height >= 12 else { return nil }
+        guard crop.width >= Config.minSelectionSide, crop.height >= Config.minSelectionSide else { return nil }
         return Target(window: window, screen: Geo.screen(containing: Geo.toCocoa(window.frame)) ?? screen, crop: crop)
     }
 }
@@ -136,7 +151,8 @@ enum HitTest {
         // 只有选区（来自 Cocoa）需要换算，这里不能再翻一次 y。
         let owner = source.frame
         let overlap = graphics.intersection(owner)
-        guard overlap.width >= 12, overlap.height >= 12, let screen = Geo.screen(containing: rect) else { return nil }
+        guard overlap.width >= Config.minSelectionSide, overlap.height >= Config.minSelectionSide,
+              let screen = Geo.screen(containing: rect) else { return nil }
         return Target(window: source, screen: screen,
                       crop: CGRect(x: overlap.minX - owner.minX, y: overlap.minY - owner.minY,
                                    width: overlap.width, height: overlap.height))
@@ -275,15 +291,11 @@ enum PinScale {
     static func frame(base: CGSize, zoom: CGFloat, anchor: CGPoint, inside current: CGRect, visible: CGRect) -> CGRect {
         let size = CGSize(width: base.width * zoom, height: base.height * zoom)
         guard current.width > 0, current.height > 0 else { return CGRect(origin: current.origin, size: size) }
-        var out = CGRect(x: anchor.x - (anchor.x - current.minX) / current.width * size.width,
+        let out = CGRect(x: anchor.x - (anchor.x - current.minX) / current.width * size.width,
                          y: anchor.y - (anchor.y - current.minY) / current.height * size.height,
                          width: size.width, height: size.height)
         // 贴边放大时会探出屏幕，整体平移回来——平移不动尺寸，也就不动长宽比。
-        out.origin.x = out.width <= visible.width ? min(max(out.minX, visible.minX), visible.maxX - out.width)
-                                                 : visible.midX - out.width / 2
-        out.origin.y = out.height <= visible.height ? min(max(out.minY, visible.minY), visible.maxY - out.height)
-                                                   : visible.midY - out.height / 2
-        return out
+        return Geo.clamp(out, into: visible)
     }
 }
 
@@ -600,64 +612,396 @@ final class Pin: NSObject, NSWindowDelegate {
 
 // MARK: - 框选遮罩
 
-final class SelectionView: NSView {
+/// 选区的 8 个调节手柄。命名按屏幕视觉方向（n 是上边），Cocoa 坐标里上边是 maxY。
+enum ResizeHandle: CaseIterable {
+    case nw, n, ne, e, se, s, sw, w
+
+    var movesMinX: Bool { self == .nw || self == .w || self == .sw }
+    var movesMaxX: Bool { self == .ne || self == .e || self == .se }
+    var movesMinY: Bool { self == .sw || self == .s || self == .se }
+    var movesMaxY: Bool { self == .nw || self == .n || self == .ne }
+
+    /// 手柄画在哪儿，也用来算命中距离。
+    static func center(_ handle: ResizeHandle, in rect: CGRect) -> CGPoint {
+        switch handle {
+        case .nw: return CGPoint(x: rect.minX, y: rect.maxY)
+        case .n: return CGPoint(x: rect.midX, y: rect.maxY)
+        case .ne: return CGPoint(x: rect.maxX, y: rect.maxY)
+        case .e: return CGPoint(x: rect.maxX, y: rect.midY)
+        case .se: return CGPoint(x: rect.maxX, y: rect.minY)
+        case .s: return CGPoint(x: rect.midX, y: rect.minY)
+        case .sw: return CGPoint(x: rect.minX, y: rect.minY)
+        case .w: return CGPoint(x: rect.minX, y: rect.midY)
+        }
+    }
+
+    /// 角优先：角同时也是两条边的端点，先试边就会把"拉角"误判成"只动一条边"。
+    static func hit(_ point: CGPoint, in rect: CGRect, tolerance: CGFloat) -> ResizeHandle? {
+        for handle in [ResizeHandle.nw, .ne, .se, .sw] {
+            let center = self.center(handle, in: rect)
+            let dx = point.x - center.x, dy = point.y - center.y
+            if dx * dx + dy * dy <= tolerance * tolerance { return handle }
+        }
+        let slack = tolerance + max(rect.width, rect.height) / 2
+        for handle in [ResizeHandle.n, .e, .s, .w] {
+            switch handle {
+            case .n: if abs(point.y - rect.maxY) <= tolerance, abs(point.x - rect.midX) <= slack { return handle }
+            case .s: if abs(point.y - rect.minY) <= tolerance, abs(point.x - rect.midX) <= slack { return handle }
+            case .w: if abs(point.x - rect.minX) <= tolerance, abs(point.y - rect.midY) <= slack { return handle }
+            case .e: if abs(point.x - rect.maxX) <= tolerance, abs(point.y - rect.midY) <= slack { return handle }
+            default: break
+            }
+        }
+        return nil
+    }
+
+    /// 以对角/对边为锚把这条边拖到 point。拉过锚点就停在最小边长，不翻转成反向矩形。
+    func resize(_ rect: CGRect, to point: CGPoint, minSide: CGFloat) -> CGRect {
+        var minX = rect.minX, maxX = rect.maxX, minY = rect.minY, maxY = rect.maxY
+        if movesMinX { minX = min(point.x, maxX - minSide) }
+        if movesMaxX { maxX = max(point.x, minX + minSide) }
+        if movesMinY { minY = min(point.y, maxY - minSide) }
+        if movesMaxY { maxY = max(point.y, minY + minSide) }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    var cursor: NSCursor {
+        switch self {
+        case .nw, .se: return SelectionCursor.northwestSoutheast
+        case .ne, .sw: return SelectionCursor.northeastSouthwest
+        case .e, .w: return .resizeLeftRight
+        case .n, .s: return .resizeUpDown
+        }
+    }
+}
+
+/// macOS 没提供对角方向的拉伸光标，两个对角各画一枚 16×16 的双头箭头。
+enum SelectionCursor {
+    static let northwestSoutheast = arrow(from: CGPoint(x: 3.5, y: 12.5), to: CGPoint(x: 12.5, y: 3.5))
+    static let northeastSouthwest = arrow(from: CGPoint(x: 3.5, y: 3.5), to: CGPoint(x: 12.5, y: 12.5))
+
+    private static func arrow(from a: CGPoint, to b: CGPoint) -> NSCursor {
+        let image = NSImage(size: NSSize(width: 16, height: 16))
+        image.lockFocus()
+        let dx = b.x - a.x, dy = b.y - a.y
+        let length = (dx * dx + dy * dy).squareRoot()
+        let ux = dx / length, uy = dy / length
+        let path = NSBezierPath()
+        path.move(to: a)
+        path.line(to: b)
+        for (tip, sign) in [(a, -1.0), (b, 1.0)] {
+            for angle in [0.44, -0.44] {
+                let wx = (ux * sign * CGFloat(cos(angle)) - uy * sign * CGFloat(sin(angle))) * 4.5
+                let wy = (ux * sign * CGFloat(sin(angle)) + uy * sign * CGFloat(cos(angle))) * 4.5
+                path.move(to: tip)
+                path.line(to: CGPoint(x: tip.x + wx, y: tip.y + wy))
+            }
+        }
+        path.lineWidth = 3
+        NSColor.white.setStroke()
+        path.stroke()
+        path.lineWidth = 1.4
+        NSColor.black.setStroke()
+        path.stroke()
+        image.unlockFocus()
+        return NSCursor(image: image, hotSpot: CGPoint(x: 8, y: 8))
+    }
+}
+
+/// 纯几何排版，不碰屏幕和字体，`--seltest` 可以直接算。
+enum SelectionLayout {
+    static let pillWidth: CGFloat = 64
+    static let pillHeight: CGFloat = 26
+    static let gap: CGFloat = 8
+    static let offset: CGFloat = 12
+
+    /// 遮罩窗的 frame 恰好等于所在屏的 frame，所以 view-local 就是全局减去屏原点。
+    static func toLocal(_ rect: CGRect, origin: CGPoint) -> CGRect {
+        rect.offsetBy(dx: -origin.x, dy: -origin.y)
+    }
+
+    static func toGlobal(_ rect: CGRect, origin: CGPoint) -> CGRect {
+        rect.offsetBy(dx: origin.x, dy: origin.y)
+    }
+
+    static func toLocal(_ point: CGPoint, origin: CGPoint) -> CGPoint {
+        CGPoint(x: point.x - origin.x, y: point.y - origin.y)
+    }
+
+    /// 确定/取消这一组按钮优先放在选区下方、右端与选区对齐；下方放不下就翻到上方，
+    /// 再放不下落进选区内部底边。available 是"选区底边中点所在那块屏"的 frame，
+    /// 所以整组按钮始终在一块屏上、也始终点得到。
+    static func pills(rect: CGRect, in available: CGRect) -> (ok: CGRect, cancel: CGRect) {
+        let group = pillWidth * 2 + gap
+        let x = min(max(rect.maxX - group, available.minX + 4),
+                    max(available.maxX - 4 - group, available.minX + 4))
+        let candidates = [rect.minY - offset - pillHeight, rect.maxY + offset, rect.minY + offset]
+        let y = candidates.first { $0 >= available.minY + 4 && $0 + pillHeight <= available.maxY - 4 }
+            ?? max(available.minY + 4, min(candidates[0], available.maxY - 4 - pillHeight))
+        return (CGRect(x: x, y: y, width: pillWidth, height: pillHeight),
+                CGRect(x: x + pillWidth + gap, y: y, width: pillWidth, height: pillHeight))
+    }
+}
+
+/// 选区状态存在 view 之外：遮罩是每块屏一个窗，矩形却能跨屏拖，
+/// 状态挂在某个 view 上时另一块屏的遮罩既画不出来也接不住拖拽。
+/// 这里一律用 Cocoa 全局坐标，view 只负责换算成本地矩形。
+final class SelectionModel {
+    enum Phase { case drawing, adjusting }
+    enum DragMode { case move, resize(ResizeHandle) }
+
+    var phase: Phase = .drawing
+    private(set) var rect: CGRect?
+    private(set) var pills: (ok: CGRect, cancel: CGRect)?
+    var hint: String?
+    var pending = false
+    /// 每次确认自增：屏幕清单是异步取的，回来时对不上号就说明用户已经改过或取消了，这一枪不能放。
+    private(set) var session = 0
+    private var drag: (mode: DragMode, start: CGPoint, origin: CGRect)?
+    private var drawStart: CGPoint?
+
+    var screenFrame: ((CGRect) -> CGRect)?
+    var onLayout: (() -> Void)?
     var onFinish: ((CGRect) -> Void)?
     var onCancel: (() -> Void)?
-    private var selection: CGRect?
-    private var start: CGPoint?
+
+    func startDraw(at point: CGPoint) {
+        phase = .drawing
+        rect = CGRect(origin: point, size: .zero)
+        drawStart = point
+        pills = nil
+        hint = nil
+        drag = nil
+        onLayout?()
+    }
+
+    func dragDraw(to point: CGPoint) {
+        guard let start = drawStart else { return }
+        rect = CGRect(x: min(start.x, point.x), y: min(start.y, point.y),
+                      width: abs(point.x - start.x), height: abs(point.y - start.y))
+        onLayout?()
+    }
+
+    /// 松手：够大就进入调整态，太小按"单击"处理。
+    func endDraw(minSide: CGFloat) -> Bool {
+        drawStart = nil
+        guard let rect, rect.width > minSide, rect.height > minSide else { return false }
+        phase = .adjusting
+        relayout()
+        onLayout?()
+        return true
+    }
+
+    func beginAdjust(_ mode: DragMode, at point: CGPoint) {
+        guard let rect, phase == .adjusting else { return }
+        drag = (mode, point, rect)
+    }
+
+    func dragAdjust(to point: CGPoint) {
+        guard let drag else { return }
+        switch drag.mode {
+        case .resize(let handle):
+            rect = handle.resize(drag.origin, to: point, minSide: Config.minSelectionSide)
+        case .move:
+            let moved = drag.origin.offsetBy(dx: point.x - drag.start.x, dy: point.y - drag.start.y)
+            // 以"选区中心落在哪块屏"决定它属于哪块屏：跨过中线才整体挪过去，
+            // 不会出现一半卡在两块屏之间的黑区里。
+            let host = screenFrame?(CGRect(x: moved.midX, y: moved.midY, width: 1, height: 1)) ?? moved
+            rect = Geo.clamp(moved, into: host)
+        }
+        relayout()
+        onLayout?()
+    }
+
+    func endAdjust() {
+        drag = nil
+    }
+
+    var isAdjusting: Bool { phase == .adjusting && rect != nil && drag == nil }
+
+    func beginSession() -> Int {
+        session += 1
+        return session
+    }
+
+    func fail(_ message: String) {
+        pending = false
+        hint = message
+        onLayout?()
+    }
+
+    private func relayout() {
+        guard let rect, phase == .adjusting else { pills = nil; return }
+        hint = nil
+        let host = screenFrame?(CGRect(x: rect.midX, y: rect.minY, width: 1, height: 1)) ?? rect
+        pills = SelectionLayout.pills(rect: rect, in: host)
+    }
+}
+
+final class SelectionView: NSView {
+    var model: SelectionModel?
+    private var pushedCursor = false
 
     override var mouseDownCanMoveWindow: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    /// view-local → 全局：遮罩窗覆盖整块屏，所以就是加回屏原点。
+    private var screenOrigin: CGPoint { window?.frame.origin ?? .zero }
+
+    private func globalPoint(_ event: NSEvent) -> CGPoint {
+        let local = convert(event.locationInWindow, from: nil)
+        return CGPoint(x: local.x + screenOrigin.x, y: local.y + screenOrigin.y)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
+        guard let model else { return }
         NSColor.black.withAlphaComponent(0.35).setFill()
         let dim = NSBezierPath(rect: bounds)
+        let selection = model.rect.map { SelectionLayout.toLocal($0, origin: screenOrigin) }
         if let selection { dim.appendRect(selection) }
         dim.windingRule = .evenOdd
         dim.fill()
 
-        if let selection {
-            NSColor.white.withAlphaComponent(0.9).setStroke()
-            let border = NSBezierPath(rect: selection.insetBy(dx: 0.5, dy: 0.5))
-            border.lineWidth = 1
-            border.stroke()
-            "\(Int(selection.width)) × \(Int(selection.height))".draw(
-                at: CGPoint(x: selection.minX, y: selection.minY - 16),
-                withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
-                                 .foregroundColor: NSColor.white])
-        } else {
-            let hint = "拖框选中要置顶的区域，单击取消"
+        guard let selection else {
+            let hint = "拖框选中要置顶的区域，松手后可继续调整"
             let size = hint.size(withAttributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium)])
             hint.draw(at: CGPoint(x: bounds.midX - size.width / 2, y: bounds.minY + 40),
                       withAttributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium),
                                        .foregroundColor: NSColor.white.withAlphaComponent(0.85)])
+            return
+        }
+
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        let border = NSBezierPath(rect: selection.insetBy(dx: 0.5, dy: 0.5))
+        border.lineWidth = 1
+        border.stroke()
+        let sizeText = "\(Int(selection.width)) × \(Int(selection.height))"
+        let sizeAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.white,
+        ]
+        // 调整态下选区下方要留给按钮，尺寸数字挪到左上角，免得两样东西叠在一起。
+        let labelY = model.phase == .drawing ? selection.minY - 16 : selection.maxY + 4
+        sizeText.draw(at: CGPoint(x: selection.minX, y: labelY), withAttributes: sizeAttrs)
+        guard model.phase == .adjusting else { return }
+
+        let side = Config.handleSize
+        NSColor.white.setFill()
+        for handle in ResizeHandle.allCases {
+            let center = SelectionLayout.toLocal(ResizeHandle.center(handle, in: model.rect ?? .zero),
+                                                 origin: screenOrigin)
+            NSBezierPath(rect: CGRect(x: center.x - side / 2, y: center.y - side / 2, width: side, height: side)).fill()
+        }
+        guard let pills = model.pills else { return }
+        let ok = SelectionLayout.toLocal(pills.ok, origin: screenOrigin)
+        let cancel = SelectionLayout.toLocal(pills.cancel, origin: screenOrigin)
+        drawPill("确定", in: ok, filled: true)
+        drawPill("取消", in: cancel, filled: false)
+        if let hint = model.hint {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium), .foregroundColor: NSColor.systemRed,
+            ]
+            let size = hint.size(withAttributes: attrs)
+            // 提示写在按钮组左边：这一行只在失败时出现，插在按钮和选区之间会跟选区边框叠在一起。
+            let x = max(ok.minX - 10 - size.width, bounds.minX + 4)
+            hint.draw(at: CGPoint(x: x, y: ok.midY - size.height / 2), withAttributes: attrs)
         }
     }
 
+    private func drawPill(_ title: String, in rect: CGRect, filled: Bool) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+        if filled {
+            NSColor.white.withAlphaComponent(0.95).setFill()
+            path.fill()
+        } else {
+            NSColor.white.withAlphaComponent(0.22).setFill()
+            path.fill()
+            NSColor.white.withAlphaComponent(0.7).setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: filled ? NSColor.black.withAlphaComponent(0.85) : NSColor.white,
+        ]
+        let size = title.size(withAttributes: attrs)
+        title.draw(at: CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2), withAttributes: attrs)
+    }
+
     override func mouseDown(with event: NSEvent) {
-        start = convert(event.locationInWindow, from: nil)
-        selection = CGRect(origin: start ?? .zero, size: .zero)
-        needsDisplay = true
+        guard let model else { return }
+        let point = globalPoint(event)
+        guard let rect = model.rect, model.phase == .adjusting else {
+            model.startDraw(at: point)
+            return
+        }
+        if model.pending { return }
+        if let pills = model.pills {
+            if pills.ok.contains(point) { model.onFinish?(rect); return }
+            if pills.cancel.contains(point) { model.onCancel?(); return }
+        }
+        // 双击选区内部等同于点「确定」：这套遮罩不抢键盘焦点，所以确认只给鼠标。
+        if event.clickCount >= 2, rect.contains(point) { model.onFinish?(rect); return }
+        if let handle = ResizeHandle.hit(point, in: rect, tolerance: Config.handleHit) {
+            model.beginAdjust(.resize(handle), at: point)
+            handle.cursor.push()
+            pushedCursor = true
+            return
+        }
+        if rect.contains(point) {
+            model.beginAdjust(.move, at: point)
+            NSCursor.openHand.push()
+            pushedCursor = true
+            return
+        }
+        // 框外按下：重新框选；接着单击（没拖出尺寸）就是取消整个取框。
+        model.startDraw(at: point)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let start else { return }
-        let now = convert(event.locationInWindow, from: nil)
-        selection = CGRect(x: min(start.x, now.x), y: min(start.y, now.y),
-                           width: abs(now.x - start.x), height: abs(now.y - start.y))
-        needsDisplay = true
+        guard let model else { return }
+        let point = globalPoint(event)
+        switch model.phase {
+        case .drawing: model.dragDraw(to: point)
+        case .adjusting: model.dragAdjust(to: point)
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
-        let rect = selection
-        start = nil
-        selection = nil
-        needsDisplay = true
-        guard let rect, rect.width > 12, rect.height > 12, let window else { onCancel?(); return }
-        onFinish?(window.convertToScreen(rect))
+        guard let model else { return }
+        if pushedCursor {
+            NSCursor.pop()
+            pushedCursor = false
+        }
+        switch model.phase {
+        case .drawing:
+            if !model.endDraw(minSide: Config.minSelectionSide) { model.onCancel?() }
+        case .adjusting:
+            model.endAdjust()
+        }
+    }
+
+    /// 光标形状走 AppKit 的 cursor rect：遮罩窗不是 key window，mouseMoved 本来就不保证送到这儿。
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .arrow)
+        guard let model, model.isAdjusting, let rect = model.rect else { return }
+        let local = SelectionLayout.toLocal(rect, origin: screenOrigin)
+        addCursorRect(local, cursor: .openHand)
+        if let pills = model.pills {
+            addCursorRect(SelectionLayout.toLocal(pills.ok, origin: screenOrigin), cursor: .pointingHand)
+            addCursorRect(SelectionLayout.toLocal(pills.cancel, origin: screenOrigin), cursor: .pointingHand)
+        }
+        let reach = Config.handleHit
+        for handle in ResizeHandle.allCases {
+            let center = SelectionLayout.toLocal(ResizeHandle.center(handle, in: rect), origin: screenOrigin)
+            addCursorRect(CGRect(x: center.x - reach, y: center.y - reach, width: reach * 2, height: reach * 2),
+                          cursor: handle.cursor)
+        }
     }
 }
 
+/// 遮罩故意不做 key 窗口：一做就会把键盘焦点从被框选的 App 那儿抢走，
+/// 带"失焦就暂停"内容的窗口会闪一下。`Esc` 因此走全局热键，见 HotKey.installEscape。
 final class SelectionWindow: NSWindow {
     init(screen: NSScreen) {
         super.init(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
@@ -769,8 +1113,11 @@ enum HotKey {
     private static let keycode = UInt32(kVK_F2)
     private static let modifiers = UInt32(0)
     private static var registration: EventHotKeyRef?
+    private static var escapeRegistration: EventHotKeyRef?
 
     static var onPress: (() -> Void)?
+    /// `Esc` 只在取框那几秒里归我们，平时不抢：全局热键会吃掉按键，源 App 就收不到了。
+    static var onEscape: (() -> Void)?
 
     @discardableResult
     static func install() -> Bool {
@@ -783,11 +1130,36 @@ enum HotKey {
         registration = ref
         return true
     }
+
+    /// 遮罩不是 key 窗口（那样会把源 App 的键盘焦点抢走），所以 `Esc` 只能走全局热键这一条路，
+    /// 好处是不需要辅助功能授权，代价是只在取框期间生效。
+    @discardableResult
+    static func installEscape() -> Bool {
+        guard escapeRegistration == nil else { return true }
+        var ref: EventHotKeyRef?
+        let id = EventHotKeyID(signature: OSType(0x5350494E), id: 2)
+        guard RegisterEventHotKey(UInt32(kVK_Escape), modifiers, id, GetEventDispatcherTarget(), 0, &ref) == noErr,
+              let ref else { return false }
+        escapeRegistration = ref
+        return true
+    }
+
+    static func removeEscape() {
+        if let escapeRegistration { UnregisterEventHotKey(escapeRegistration) }
+        escapeRegistration = nil
+    }
 }
 
-/// Carbon 的回调不能捕获上下文，动作挂在 HotKey.onPress 上；它由主线程事件循环派发。
+/// Carbon 的回调不能捕获上下文，动作挂在 HotKey.onPress / onEscape 上；它由主线程事件循环派发。
 private func hotKeyFired(_ call: EventHandlerCallRef?, _ event: EventRef?, _ userData: UnsafeMutableRawPointer?) -> OSStatus {
-    HotKey.onPress?()
+    var hotKeyID = EventHotKeyID()
+    let read = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                 nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+    if read == noErr && hotKeyID.id == 2 {
+        HotKey.onEscape?()
+    } else {
+        HotKey.onPress?()
+    }
     return noErr
 }
 
@@ -797,6 +1169,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     static private(set) var shared: AppController?
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var selectionWindows: [SelectionWindow] = []
+    private var selectionModel: SelectionModel?
     private var settingsWindow: SettingsWindow?
     private var busy = false
     var pins: [Pin] = []
@@ -813,6 +1186,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             button.image = image
         }
         HotKey.onPress = { [weak self] in self?.beginSelection() }
+        HotKey.onEscape = { [weak self] in self?.cancelSelection() }
         let hotKeyReady = HotKey.install()
         statusItem.menu = buildMenu(hotKeyReady: hotKeyReady)
         if !hotKeyReady { flash("fn+F2 注册失败") }
@@ -825,6 +1199,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         // 开发用：不用点菜单栏就能把设置窗打开，方便截图核对排版。
         if CommandLine.arguments.contains("--settings") { showSettings() }
+        // 开发用：直接把遮罩开到调整态，截图核对选区、手柄和按钮的排版。
+        if let raw = CommandLine.arguments.first(where: { $0.hasPrefix("--selshow=") })?
+            .dropFirst("--selshow=".count) {
+            let numbers = raw.split(separator: ",").compactMap { Double($0) }
+            guard numbers.count == 4 else {
+                say("selshow 参数应为 --selshow=x,y,w,h（Cocoa 全局坐标，单位点）")
+                return
+            }
+            showSelection(rect: CGRect(x: numbers[0], y: numbers[1], width: numbers[2], height: numbers[3]))
+        }
     }
 
     private func buildMenu(hotKeyReady: Bool) -> NSMenu {
@@ -866,41 +1250,82 @@ final class AppController: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { button.title = original }
     }
 
+    /// 开发用：直接跳到调整态并画上给定选区，让没有真实鼠标的机器也能截图核对排版。
+    func showSelection(rect: CGRect) {
+        beginSelection()
+        guard let model = selectionModel else { return }
+        model.startDraw(at: rect.origin)
+        model.dragDraw(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        guard model.endDraw(minSide: Config.minSelectionSide) else { return }
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        if !HitTest.normalWindows().contains(where: { $0.1.contains(center) }) {
+            model.fail("这里没有可钉住的窗口")
+        }
+    }
+
     @objc private func beginSelection() {
         guard !busy else { return }
         guard pins.count < Config.maxPins else { flash("最多同时钉 \(Config.maxPins) 个"); return }
         busy = true
+        let model = SelectionModel()
+        model.screenFrame = { rect in (Geo.screen(containing: rect) ?? NSScreen.main)?.frame ?? rect }
+        model.onLayout = { [weak self] in self?.refreshSelectionOverlay() }
+        model.onFinish = { [weak self] rect in self?.confirm(rect) }
+        model.onCancel = { [weak self] in self?.dismiss() }
+        selectionModel = model
         selectionWindows = NSScreen.screens.map { screen in
             let window = SelectionWindow(screen: screen)
-            (window.contentView as? SelectionView)?.onFinish = { [weak self] rect in self?.finish(rect) }
-            (window.contentView as? SelectionView)?.onCancel = { [weak self] in self?.dismiss() }
+            (window.contentView as? SelectionView)?.model = model
             window.orderFrontRegardless()
             return window
+        }
+        // 取框这几秒里把 Esc 借过来当取消键；注册失败也只是退回"点按钮取消"，不影响主流程。
+        if !HotKey.installEscape() { say("Esc 热键注册失败，取消只能点按钮或单击框外") }
+    }
+
+    /// 选区一变，每块屏上的遮罩都要重画，光标区域也要跟着重新登记。
+    private func refreshSelectionOverlay() {
+        for window in selectionWindows {
+            guard let view = window.contentView else { continue }
+            view.needsDisplay = true
+            window.invalidateCursorRects(for: view)
         }
     }
 
     private func dismiss() {
+        HotKey.removeEscape()
         selectionWindows.forEach { $0.orderOut(nil) }
         selectionWindows = []
+        selectionModel = nil
         busy = false
     }
 
-    private func finish(_ rect: CGRect) {
+    /// 全局热键是常驻回调，取框已经结束时收到的那一次要丢掉，不能顺手关掉别的东西。
+    private func cancelSelection() {
+        guard busy, selectionModel != nil else { return }
+        dismiss()
+    }
+
+    /// 确认截取：命中失败时不关遮罩、不清选区，只把原因写在按钮旁边，让用户接着改。
+    private func confirm(_ rect: CGRect) {
+        guard let model = selectionModel, !model.pending else { return }
+        model.pending = true
+        let session = model.beginSession()
         Task { @MainActor in
-            defer { self.dismiss() }
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-                guard let target = HitTest.target(forCocoa: rect, content: content) else {
-                    self.flash("这里没有可钉住的窗口")
-                    return
-                }
-                let pin = Pin(target: target)
-                self.pins.append(pin)
-                pin.panel.orderFrontRegardless()
-            } catch {
-                say("SCShareableContent 失败: \(error.localizedDescription)")
-                self.flash("屏幕录制权限不足")
+            let content = try? await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+            guard self.selectionModel === model, model.session == session else { return }
+            guard let content else {
+                model.fail("屏幕录制权限不足，授权后要退出重开")
+                return
             }
+            guard let target = HitTest.target(forCocoa: rect, content: content) else {
+                model.fail("这里没有可钉住的窗口")
+                return
+            }
+            self.dismiss()
+            let pin = Pin(target: target)
+            self.pins.append(pin)
+            pin.panel.orderFrontRegardless()
         }
     }
 
@@ -922,6 +1347,68 @@ final class AppController: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+}
+
+// MARK: - 构建期自测：框选的几何（手柄命中、拉伸下限、平移钳制、按钮排版）
+
+/// 全是纯算术，不需要屏幕录制权限、也不需要真实鼠标：这台机器合成不了点击事件，
+/// 所以把手柄会不会翻转、按钮会不会跑到屏外这类问题放在这里验，剩下的留给肉眼。
+enum SelTest {
+    static func run() -> Int32 {
+        var failures: [String] = []
+        func check(_ label: String, _ ok: Bool) { if !ok { failures.append(label) } }
+        func close(_ a: CGFloat, _ b: CGFloat) -> Bool { abs(a - b) < 0.001 }
+
+        let base = CGRect(x: 100, y: 100, width: 200, height: 200) // x: 100…300，y: 100…300
+        let min = Config.minSelectionSide
+        let screen = CGRect(x: 0, y: 0, width: 1000, height: 600)
+
+        for handle in [ResizeHandle.nw, .ne, .se, .sw] {
+            let up = handle.resize(base, to: CGPoint(x: -500, y: -500), minSide: min)
+            let down = handle.resize(base, to: CGPoint(x: 5000, y: 5000), minSide: min)
+            check("\(handle) 拖过头只停在最小边长", up.width >= min && up.height >= min)
+            check("\(handle) 反方向同样不翻转", down.width >= min && down.height >= min)
+        }
+        check("角优先于边", ResizeHandle.hit(CGPoint(x: 300, y: 300), in: base,
+                                             tolerance: Config.handleHit) == .ne)
+        check("边中点命中边", ResizeHandle.hit(CGPoint(x: 200, y: 300), in: base,
+                                               tolerance: Config.handleHit) == .n)
+        check("框内不命中手柄", ResizeHandle.hit(CGPoint(x: 200, y: 200), in: base,
+                                                 tolerance: Config.handleHit) == nil)
+
+        let nw = ResizeHandle.nw.resize(base, to: CGPoint(x: 150, y: 250), minSide: min)
+        check("拖 nw 时对角 se 不动", close(nw.maxX, base.maxX) && close(nw.minY, base.minY))
+        check("拖 nw 同时改宽和高", close(nw.width, 150) && close(nw.height, 150))
+        let e = ResizeHandle.e.resize(base, to: CGPoint(x: 400, y: 500), minSide: min)
+        check("拖 e 只改宽不改高", close(e.width, 300) && close(e.height, base.height))
+
+        let pushed = Geo.clamp(CGRect(x: 900, y: -50, width: 200, height: 200), into: screen)
+        check("拖出屏外的选区整体平移回来", close(pushed.minX, 800) && close(pushed.minY, 0)
+              && close(pushed.width, 200))
+        let huge = Geo.clamp(CGRect(x: 0, y: 0, width: 1200, height: 900), into: screen)
+        check("比屏大时居中且不动尺寸", close(huge.width, 1200) && close(huge.midX, 500)
+              && close(huge.midY, 300))
+
+        let above = SelectionLayout.pills(rect: CGRect(x: 100, y: 40, width: 200, height: 200), in: screen)
+        check("底边放不下按钮就翻到选区上方", close(above.ok.minY, 240 + SelectionLayout.offset)
+              && above.ok.maxY > 240 && above.ok.intersects(screen) && above.cancel.maxX < screen.maxX)
+        check("按钮组右端与选区右端对齐", close(above.cancel.maxX, 300))
+        let insideRect = CGRect(x: 100, y: 40, width: 200, height: 200)
+        let tight = SelectionLayout.pills(rect: insideRect, in: CGRect(x: 0, y: 0, width: 1000, height: 220))
+        check("上下都放不下就落进选区内部", insideRect.contains(tight.ok.origin) && insideRect.contains(
+            CGPoint(x: tight.cancel.maxX - 1, y: tight.cancel.maxY - 1)))
+        let leftEdge = SelectionLayout.pills(rect: CGRect(x: 10, y: 300, width: 40, height: 100), in: screen)
+        check("贴左边时按钮组不越屏", leftEdge.ok.minX >= screen.minX && leftEdge.cancel.maxX <= screen.maxX)
+
+        let secondary = CGPoint(x: -1920, y: 100)
+        let roundTrip = SelectionLayout.toGlobal(SelectionLayout.toLocal(base, origin: secondary),
+                                                 origin: secondary)
+        check("副屏原点上全局/本地往返一致", roundTrip == base)
+
+        failures.forEach { say("seltest 失败: \($0)") }
+        say("seltest 完成，\(failures.isEmpty ? "全部通过" : "\(failures.count) 项失败")")
+        return failures.isEmpty ? 0 : 1
     }
 }
 
@@ -1010,7 +1497,9 @@ let controller = AppController()
 app.delegate = controller
 let arguments = CommandLine.arguments
 
-if arguments.contains("--snaptest") {
+if arguments.contains("--seltest") {
+    exit(SelTest.run())
+} else if arguments.contains("--snaptest") {
     Task { await Probe.run() }
 } else if let raw = arguments.first(where: { $0.hasPrefix("--autopin=") })?.dropFirst("--autopin=".count) {
     let numbers = raw.split(separator: ",").compactMap { Double($0) }
