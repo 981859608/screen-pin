@@ -292,20 +292,6 @@ final class PinRootView: NSView {
     }
     private static let focusRing: CGFloat = 2
     private var tracking: NSTrackingArea?
-    private var edge: Edge?
-    private var dragStart = CGPoint.zero
-    private var frameAtDragStart = CGRect.zero
-
-    private struct Edge: OptionSet {
-        let rawValue: Int
-        static let left = Edge(rawValue: 1)
-        static let right = Edge(rawValue: 2)
-        static let top = Edge(rawValue: 4)
-        static let bottom = Edge(rawValue: 8)
-        static let none = Edge(rawValue: 0)
-    }
-
-    private static let band: CGFloat = 9
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -343,13 +329,6 @@ final class PinRootView: NSView {
         statusLabel.frame = CGRect(x: 0, y: bounds.midY - 9, width: bounds.width, height: 18)
     }
 
-    /// 贴边时不能让 AppKit 抢走这次拖拽去移动窗口，否则缩放和移动会同时发生。
-    override var mouseDownCanMoveWindow: Bool {
-        guard let window else { return true }
-        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
-        return edge(at: point).isEmpty && !closeButton.frame.contains(point)
-    }
-
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
@@ -359,57 +338,18 @@ final class PinRootView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) { closeButton.isHidden = false }
-    override func mouseExited(with event: NSEvent) { if edge == nil { closeButton.isHidden = true } }
-
-    private func edge(at point: CGPoint) -> Edge {
-        var result: Edge = .none
-        if point.x < Self.band { result.insert(.left) }
-        if point.x > bounds.maxX - Self.band { result.insert(.right) }
-        if point.y > bounds.maxY - Self.band { result.insert(.top) }
-        if point.y < Self.band { result.insert(.bottom) }
-        return result
-    }
+    override func mouseExited(with event: NSEvent) { closeButton.isHidden = true }
 
     @objc private func closeTapped() { onClose?() }
 
     override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        if closeButton.frame.contains(point) { closeTapped(); return }
+        if closeButton.frame.contains(convert(event.locationInWindow, from: nil)) { closeTapped(); return }
         // nonactivating 面板不会自动被点成 key 窗口，而键盘事件只发给 key 窗口的 first responder，
         // 所以点一下小窗时显式聚焦，Esc / ⌘W 才有地方收。
         window?.makeKey()
         window?.makeFirstResponder(self)
-        let hit = edge(at: point)
-        guard !hit.isEmpty, let window else { super.mouseDown(with: event); return }
-        edge = hit
-        dragStart = NSEvent.mouseLocation
-        frameAtDragStart = window.frame
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        guard let edge, let window else { return }
-        let now = NSEvent.mouseLocation
-        let dx = now.x - dragStart.x
-        let dy = dragStart.y - now.y
-        var frame = frameAtDragStart
-        if edge.contains(.left) { frame.origin.x += dx }
-        if edge.contains(.right) { frame.size.width += dx }
-        if edge.contains(.top) { frame.origin.y -= dy; frame.size.height += dy }
-        if edge.contains(.bottom) { frame.size.height -= dy }
-        if frame.width < Config.minPinSize.width {
-            if edge.contains(.left) { frame.origin.x = frameAtDragStart.maxX - Config.minPinSize.width }
-            frame.size.width = Config.minPinSize.width
-        }
-        if frame.height < Config.minPinSize.height {
-            if edge.contains(.bottom) { frame.origin.y = frameAtDragStart.maxY - Config.minPinSize.height }
-            frame.size.height = Config.minPinSize.height
-        }
-        window.setFrame(frame, display: true)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        edge = nil
-        super.mouseUp(with: event)
+        // 交给 AppKit 的 isMovableByWindowBackground：鼠标按在画面任意处都能直接拖走。
+        super.mouseDown(with: event)
     }
 
     /// 触摸板双指捏合。magnification 是相对上一个事件的增量（头文件：加到当前缩放系数上），
