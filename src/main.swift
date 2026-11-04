@@ -8,13 +8,41 @@ import ScreenCaptureKit
 
 enum Config {
     static let maxPins = 3
-    static let fps: Int32 = 30
     static let staleLimit: TimeInterval = 1.5
     static let minPinSize = CGSize(width: 24, height: 16)
     /// 捏合/滚轮缩放的上下限，相对"刚钉住时"的尺寸。放大只是把已经采到的像素摊大，
     /// 再往上就没有细节可给了。
     static let maxZoom: CGFloat = 4
     static let minZoom: CGFloat = 0.08
+    /// 帧率只给这几个档位：小于 15 明显卡顿，大于 120 采集端也不会有更多帧。
+    static let fpsChoices: [Int32] = [15, 24, 30, 60, 120]
+}
+
+/// 用户可改的偏好，直接落在 UserDefaults 上。键名改了老用户的设置会丢，所以别动。
+/// 读的时候都用 object 判一下有没有存过，否则 bool 的"没存过"会被当成 false，默认值就写不进去了。
+enum Prefs {
+    private static let d = UserDefaults.standard
+
+    private static func flag(_ key: String, _ fallback: Bool) -> Bool {
+        d.object(forKey: key) == nil ? fallback : d.bool(forKey: key)
+    }
+
+    /// 双击跳回源 App 之后是否顺手关掉这颗小窗。
+    static var closeOnReveal: Bool {
+        get { flag("closeOnReveal", true) }
+        set { d.set(newValue, forKey: "closeOnReveal") }
+    }
+
+    /// 按原屏幕的像素密度采集（Retina 上是 2 倍像素）。关掉后帧只有逻辑尺寸，省 CPU 但会糊。
+    static var nativePixels: Bool {
+        get { flag("nativePixels", true) }
+        set { d.set(newValue, forKey: "nativePixels") }
+    }
+
+    static var fps: Int32 {
+        get { d.object(forKey: "fps") == nil ? 60 : Int32(max(1, d.integer(forKey: "fps"))) }
+        set { d.set(Int(newValue), forKey: "fps") }
+    }
 }
 
 func say(_ message: String) {
@@ -167,11 +195,11 @@ final class Capture: NSObject, SCStreamDelegate, SCStreamOutput {
     private(set) var lastFrameAt = Date()
     private var stream: SCStream?
     private var target: Target?
-    private var fps: Int32 = Config.fps
+    private var fps: Int32 = Prefs.fps
     private let queue = DispatchQueue(label: "screenpin.capture")
 
-    func configuration(for target: Target, fps: Int32 = Config.fps) -> SCStreamConfiguration {
-        let scale = target.screen.backingScaleFactor
+    func configuration(for target: Target, fps: Int32 = Prefs.fps) -> SCStreamConfiguration {
+        let scale = Prefs.nativePixels ? target.screen.backingScaleFactor : 1
         let crop = target.crop
         let config = SCStreamConfiguration()
         // 头文件写明：sourceRect 是点（显示器的逻辑坐标系），width/height 是像素。
@@ -196,7 +224,7 @@ final class Capture: NSObject, SCStreamDelegate, SCStreamOutput {
         try await stream.startCapture()
         lastFrameAt = Date()
         self.target = target
-        self.fps = Config.fps
+        self.fps = Prefs.fps
         self.stream = stream
     }
 
@@ -208,8 +236,8 @@ final class Capture: NSObject, SCStreamDelegate, SCStreamOutput {
 
     /// 小窗被别的窗口挡得完全看不见时降帧，省 CPU 和电。
     func setVisible(_ visible: Bool) {
-        guard let stream, let target, visible != (fps == Config.fps) else { return }
-        fps = visible ? Config.fps : 5
+        guard let stream, let target, visible != (fps == Prefs.fps) else { return }
+        fps = visible ? Prefs.fps : 5
         stream.updateConfiguration(configuration(for: target, fps: fps), completionHandler: nil)
     }
 
@@ -533,6 +561,19 @@ final class Pin: NSObject, NSWindowDelegate {
         }
         if app.isHidden { app.unhide() }
         app.activate(options: [])
+        // 跳回去之后这颗小窗通常就没用了（它盖住的正是那块内容），所以默认关掉；设置里可以关这个行为。
+        if Prefs.closeOnReveal { close() }
+    }
+
+    /// 质量相关的偏好改了要重建这一路捕获。
+    /// 不走 restart(with:)：那条会把缩放基线重置回 1x，用户会看到小窗尺寸突然跳一下。
+    func reconfigure() {
+        guard !isClosed else { return }
+        let target = self.target
+        Task { @MainActor in
+            await self.capture.stop()
+            try? await self.capture.start(target: target)
+        }
     }
 
     func close() {
@@ -634,6 +675,90 @@ final class SelectionWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 }
 
+// MARK: - 设置窗口
+
+/// 代码搭的小表单，不引 xib 也不引 SwiftUI：保持单文件、只链系统框架。
+final class SettingsWindow: NSWindow {
+    private let closeOnRevealToggle = NSButton(checkboxWithTitle: "双击跳回主应用后自动关闭小窗", target: nil, action: nil)
+    private let nativePixelsToggle = NSButton(checkboxWithTitle: "像素与原屏幕一致（高清）", target: nil, action: nil)
+    private let fpsPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let fpsLabel = NSTextField(labelWithString: "帧率")
+    private let note = NSTextField(wrappingLabelWithString: "")
+
+    init() {
+        super.init(contentRect: CGRect(x: 0, y: 0, width: 460, height: 200),
+                   styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        title = "ScreenPin 设置"
+        isReleasedWhenClosed = false
+        // 普通窗口会被自己那些置顶小窗盖住（它们在屏蔽层之上），设置窗也得浮起来才点得到。
+        level = .floating
+
+        closeOnRevealToggle.target = self
+        closeOnRevealToggle.action = #selector(closeOnRevealChanged(_:))
+        nativePixelsToggle.target = self
+        nativePixelsToggle.action = #selector(nativePixelsChanged(_:))
+        fpsPopUp.target = self
+        fpsPopUp.action = #selector(fpsChanged(_:))
+        fpsPopUp.addItems(withTitles: Config.fpsChoices.map { String($0) })
+
+        note.stringValue = "改帧率或高清像素会立刻重启已有小窗的画面，小窗的尺寸和缩放不变。"
+            + "屏幕本身只有 60Hz 时，选 120 也不会多出帧来。"
+        note.font = .systemFont(ofSize: 11)
+        note.textColor = .secondaryLabelColor
+        note.preferredMaxLayoutWidth = 420
+
+        let fpsRow = NSStackView(views: [fpsLabel, fpsPopUp])
+        fpsRow.orientation = .horizontal
+        fpsRow.spacing = 8
+
+        let stack = NSStackView(views: [Self.heading("交互"), closeOnRevealToggle,
+                                        Self.heading("质量配置"), nativePixelsToggle, fpsRow, note])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.setCustomSpacing(18, after: closeOnRevealToggle)
+        stack.setCustomSpacing(16, after: fpsRow)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSView()
+        content.addSubview(stack)
+        contentView = content
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -20),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -18),
+        ])
+
+        syncFromPrefs()
+    }
+
+    private static func heading(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        return label
+    }
+
+    func syncFromPrefs() {
+        closeOnRevealToggle.state = Prefs.closeOnReveal ? .on : .off
+        nativePixelsToggle.state = Prefs.nativePixels ? .on : .off
+        fpsPopUp.selectItem(at: Config.fpsChoices.firstIndex(of: Prefs.fps) ?? Config.fpsChoices.count - 1)
+    }
+
+    @objc private func closeOnRevealChanged(_ sender: NSButton) { Prefs.closeOnReveal = sender.state == .on }
+
+    @objc private func nativePixelsChanged(_ sender: NSButton) {
+        Prefs.nativePixels = sender.state == .on
+        AppController.shared?.applyQualityToPins()
+    }
+
+    @objc private func fpsChanged(_ sender: NSPopUpButton) {
+        Prefs.fps = Config.fpsChoices[max(0, min(sender.indexOfSelectedItem, Config.fpsChoices.count - 1))]
+        AppController.shared?.applyQualityToPins()
+    }
+}
+
 // MARK: - 全局快捷键
 
 /// 用 Carbon 热键而不是事件监听：Carbon 不额外要"辅助功能"授权就能全局收键。
@@ -672,6 +797,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     static private(set) var shared: AppController?
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var selectionWindows: [SelectionWindow] = []
+    private var settingsWindow: SettingsWindow?
     private var busy = false
     var pins: [Pin] = []
 
@@ -697,6 +823,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             CGRequestScreenCaptureAccess()
             flash("需要屏幕录制权限，授权后请重开")
         }
+        // 开发用：不用点菜单栏就能把设置窗打开，方便截图核对排版。
+        if CommandLine.arguments.contains("--settings") { showSettings() }
     }
 
     private func buildMenu(hotKeyReady: Bool) -> NSMenu {
@@ -706,6 +834,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "关闭全部小窗", action: #selector(closeAll), keyEquivalent: "").target = self
         menu.addItem(withTitle: "重新申请屏幕录制权限", action: #selector(requestPermission), keyEquivalent: "").target = self
         menu.addItem(.separator())
+        menu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",").target = self
+        menu.addItem(.separator())
         menu.addItem(withTitle: "退出 ScreenPin", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q").target = NSApp
         return menu
     }
@@ -714,6 +844,19 @@ final class AppController: NSObject, NSApplicationDelegate {
         CGRequestScreenCaptureAccess()
         flash(CGPreflightScreenCaptureAccess() ? "权限已有" : "授权后请退出重开")
     }
+
+    @objc private func showSettings() {
+        let window = settingsWindow ?? SettingsWindow()
+        settingsWindow = window
+        window.syncFromPrefs()
+        window.center()
+        // accessory 应用没有主菜单，窗口不主动 activate 会只是冒出来、拿不到键盘焦点。
+        NSApp.activate()
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    /// 质量项（像素密度、帧率）改了，让所有在跑的小窗立刻按新配置重建捕获。
+    func applyQualityToPins() { pins.forEach { $0.reconfigure() } }
 
     private func flash(_ message: String) {
         say(message)
