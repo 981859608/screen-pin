@@ -10,11 +10,11 @@ enum Config {
     static let maxPins = 3
     static let fps: Int32 = 30
     static let staleLimit: TimeInterval = 1.5
-    static let minPinSize = CGSize(width: 120, height: 80)
+    static let minPinSize = CGSize(width: 24, height: 16)
     /// 捏合/滚轮缩放的上下限，相对"刚钉住时"的尺寸。放大只是把已经采到的像素摊大，
     /// 再往上就没有细节可给了。
     static let maxZoom: CGFloat = 4
-    static let minZoom: CGFloat = 0.4
+    static let minZoom: CGFloat = 0.08
 }
 
 func say(_ message: String) {
@@ -330,7 +330,11 @@ final class PinRootView: NSView {
         super.layout()
         // 画面层要留出亮边的宽度，否则会把它整个盖住。
         displayLayer.frame = isFocused ? bounds.insetBy(dx: Self.focusRing, dy: Self.focusRing) : bounds
-        closeButton.frame = CGRect(x: bounds.maxX - 20, y: bounds.maxY - 18, width: 20, height: 18)
+        // 小窗可以缩得很小，按钮得跟着缩：一颗固定 20pt 的 ✕ 会盖住整块画面，
+        // 鼠标一碰就误关，而且那时已经没有地方能按住拖动了。
+        let side = max(6, min(bounds.width * 0.5, bounds.height * 0.5, 20))
+        closeButton.font = .systemFont(ofSize: max(6, min(11, side * 0.6)), weight: .bold)
+        closeButton.frame = CGRect(x: bounds.maxX - side, y: bounds.maxY - side, width: side, height: side)
         statusLabel.frame = CGRect(x: 0, y: bounds.midY - 9, width: bounds.width, height: 18)
     }
 
@@ -459,12 +463,12 @@ final class Pin: NSObject, NSWindowDelegate {
     }
 
     private func frameOrigin(target: Target) -> CGRect {
-        let visible = target.screen.visibleFrame
-        let size = target.crop.size
-        // 选区接近整屏时右上角会算出负坐标，所以夹住左/下边界，别让小窗跑出屏幕。
-        return CGRect(x: max(visible.minX, visible.maxX - size.width - 16),
-                      y: max(visible.minY, visible.maxY - size.height - 16),
-                      width: size.width, height: size.height)
+        // 钉在选区原来就在的位置：小窗看起来是"就地变成一块实时画面"，不会跳到屏幕右上角。
+        // crop 是相对源窗口左上角的、y 向下的量，所以要拼回全局坐标再翻成 Cocoa 的左下角原点。
+        let owner = target.window.frame
+        let graphics = CGRect(x: owner.minX + target.crop.minX, y: owner.minY + target.crop.minY,
+                              width: target.crop.width, height: target.crop.height)
+        return CGRect(origin: Geo.toCocoa(graphics).origin, size: target.crop.size)
     }
 
     private func handle(_ buffer: CMSampleBuffer) {
