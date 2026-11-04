@@ -175,9 +175,11 @@ final class Capture: NSObject, SCStreamDelegate, SCStreamOutput {
         let crop = target.crop
         let config = SCStreamConfiguration()
         // 头文件写明：sourceRect 是点（显示器的逻辑坐标系），width/height 是像素。
+        // 取整用四舍五入而不是截断：小窗的长宽比是按 sourceRect 的点尺寸定的，
+        // 帧的像素尺寸越贴近它，resizeAspect 越不会补出黑边。
         config.sourceRect = crop
-        config.width = Int(crop.width * scale)
-        config.height = Int(crop.height * scale)
+        config.width = Int((crop.width * scale).rounded())
+        config.height = Int((crop.height * scale).rounded())
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.minimumFrameInterval = CMTime(value: 1, timescale: fps)
         config.queueDepth = 3
@@ -231,27 +233,28 @@ enum PinScale {
     static let wheelStep: CGFloat = -0.2
     static let trackpadStep: CGFloat = -0.014
 
-    /// 以 anchor（全局坐标）为不动点把小窗放大/缩小 factor 倍。
-    /// 倍率整体夹在最小尺寸、最大倍率和屏幕可见区之间，而不是分别夹宽高——
-    /// 分轴夹会改掉长宽比，画面层 resizeAspect 就开始留黑边。
-    static func zoomed(_ frame: CGRect, by factor: CGFloat, anchor: CGPoint, base: CGSize, visible: CGRect) -> CGRect {
-        guard frame.width > 0, frame.height > 0, base.width > 0, base.height > 0 else { return frame }
-        let lower = max(Config.minPinSize.width / frame.width, Config.minPinSize.height / frame.height,
-                        Config.minZoom * base.width / frame.width, Config.minZoom * base.height / frame.height)
-        let upper = min(Config.maxZoom * base.width / frame.width, Config.maxZoom * base.height / frame.height,
-                        visible.width / frame.width, visible.height / frame.height)
-        guard upper >= lower else { return frame }
-        let f = min(max(factor, lower), upper)
-        guard f != 1 else { return frame }
+    /// 倍率的合法区间：上下限都按"刚钉住时的尺寸"来定，所以倍率是唯一的自由度。
+    static func clamp(_ zoom: CGFloat, base: CGSize, visible: CGRect) -> CGFloat {
+        let lower = max(Config.minPinSize.width / base.width, Config.minPinSize.height / base.height, Config.minZoom)
+        let upper = min(Config.maxZoom, visible.width / base.width, visible.height / base.height)
+        guard upper > lower else { return lower }
+        return min(max(zoom, lower), upper)
+    }
 
-        var out = CGRect(x: anchor.x - (anchor.x - frame.minX) * f,
-                         y: anchor.y - (anchor.y - frame.minY) * f,
-                         width: frame.width * f, height: frame.height * f)
-        // 贴着屏幕边缘放大时窗口会探出屏幕，整体平移回来（平移不改变倍率）。
-        if out.width <= visible.width { out.origin.x = min(max(out.minX, visible.minX), visible.maxX - out.width) }
-        else { out.origin.x = visible.midX - out.width / 2 }
-        if out.height <= visible.height { out.origin.y = min(max(out.minY, visible.minY), visible.maxY - out.height) }
-        else { out.origin.y = visible.midY - out.height / 2 }
+    /// 把小窗摆成 base × zoom 的尺寸，并让 anchor（全局坐标）在小窗内的相对位置保持不变。
+    /// 尺寸一律从 base 算、不从当前 frame 反推：当前 frame 已经被屏幕像素网格取整过，
+    /// 反复放大缩小时那点零头会累成长宽比偏差，resizeAspect 就冒出黑边。
+    static func frame(base: CGSize, zoom: CGFloat, anchor: CGPoint, inside current: CGRect, visible: CGRect) -> CGRect {
+        let size = CGSize(width: base.width * zoom, height: base.height * zoom)
+        guard current.width > 0, current.height > 0 else { return CGRect(origin: current.origin, size: size) }
+        var out = CGRect(x: anchor.x - (anchor.x - current.minX) / current.width * size.width,
+                         y: anchor.y - (anchor.y - current.minY) / current.height * size.height,
+                         width: size.width, height: size.height)
+        // 贴边放大时会探出屏幕，整体平移回来——平移不动尺寸，也就不动长宽比。
+        out.origin.x = out.width <= visible.width ? min(max(out.minX, visible.minX), visible.maxX - out.width)
+                                                 : visible.midX - out.width / 2
+        out.origin.y = out.height <= visible.height ? min(max(out.minY, visible.minY), visible.maxY - out.height)
+                                                   : visible.midY - out.height / 2
         return out
     }
 }
@@ -281,6 +284,8 @@ final class PinRootView: NSView {
     var onClose: (() -> Void)?
     /// 刚钉住时的尺寸，缩放倍率的基准由它算出。
     var baseSize: CGSize = .zero
+    /// 相对 baseSize 的倍率。尺寸一律由 baseSize × 倍率得出，不从当前 frame 反推。
+    private var zoomLevel: CGFloat = 1
     /// 聚焦状态。键盘事件只发给 key 窗口，所以得让用户看得出当前按 Esc 关掉的是哪一个。
     var isFocused = false {
         didSet {
@@ -368,12 +373,22 @@ final class PinRootView: NSView {
     }
 
     private func zoom(by factor: CGFloat, windowPoint: CGPoint?) {
-        guard let window, factor != 1 else { return }
+        guard let window, factor != 1, baseSize.width > 0, baseSize.height > 0 else { return }
         let anchor = windowPoint.map { window.convertPoint(toScreen: $0) } ?? NSEvent.mouseLocation
         let visible = window.screen?.visibleFrame ?? NSScreen.main?.frame ?? window.frame
-        let next = PinScale.zoomed(window.frame, by: factor, anchor: anchor, base: baseSize, visible: visible)
+        zoomLevel = PinScale.clamp(zoomLevel * factor, base: baseSize, visible: visible)
+        let next = PinScale.frame(base: baseSize, zoom: zoomLevel, anchor: anchor, inside: window.frame, visible: visible)
         guard next != window.frame else { return }
         window.setFrame(next, display: true)
+    }
+
+    /// 重新钉住时（换屏幕、源窗口自己改了尺寸）裁剪尺寸变了但小窗尺寸没变，
+    /// 把当前实际尺寸认作新的 1x 基线。基线必须对齐实际尺寸，
+    /// 否则下一次缩放会把窗口硬拽回旧基线算出来的尺寸。
+    func resetZoomBaseline() {
+        guard let window else { return }
+        baseSize = window.frame.size
+        zoomLevel = 1
     }
 
     /// 普通 NSView 默认不接受键盘焦点，不打开它 keyDown 收不到 Esc / ⌘W。
@@ -488,6 +503,7 @@ final class Pin: NSObject, NSWindowDelegate {
 
     func restart(with window: SCWindow) {
         guard let next = target.resolved(with: window) else { markStale(); return }
+        root.resetZoomBaseline()
         Task { @MainActor in
             await self.capture.stop()
             try? await self.capture.start(target: next)
