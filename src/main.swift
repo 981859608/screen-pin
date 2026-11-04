@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Carbon
 import CoreImage
 import ScreenCaptureKit
 
@@ -10,6 +11,10 @@ enum Config {
     static let fps: Int32 = 30
     static let staleLimit: TimeInterval = 1.5
     static let minPinSize = CGSize(width: 120, height: 80)
+    /// 捏合/滚轮缩放的上下限，相对"刚钉住时"的尺寸。放大只是把已经采到的像素摊大，
+    /// 再往上就没有细节可给了。
+    static let maxZoom: CGFloat = 4
+    static let minZoom: CGFloat = 0.4
 }
 
 func say(_ message: String) {
@@ -218,10 +223,54 @@ final class Capture: NSObject, SCStreamDelegate, SCStreamOutput {
     }
 }
 
+// MARK: - 小窗等比缩放
+
+enum PinScale {
+    /// 滚轮一格约 ±15%，触摸板每个滚动单位约 ±1%（精确滚动的事件密、单步小）。
+    /// deltaY 为正 = 朝下滚 = 缩小，所以这里是负号；实测方向反了就翻这两个常量的符号。
+    static let wheelStep: CGFloat = -0.2
+    static let trackpadStep: CGFloat = -0.014
+
+    /// 以 anchor（全局坐标）为不动点把小窗放大/缩小 factor 倍。
+    /// 倍率整体夹在最小尺寸、最大倍率和屏幕可见区之间，而不是分别夹宽高——
+    /// 分轴夹会改掉长宽比，画面层 resizeAspect 就开始留黑边。
+    static func zoomed(_ frame: CGRect, by factor: CGFloat, anchor: CGPoint, base: CGSize, visible: CGRect) -> CGRect {
+        guard frame.width > 0, frame.height > 0, base.width > 0, base.height > 0 else { return frame }
+        let lower = max(Config.minPinSize.width / frame.width, Config.minPinSize.height / frame.height,
+                        Config.minZoom * base.width / frame.width, Config.minZoom * base.height / frame.height)
+        let upper = min(Config.maxZoom * base.width / frame.width, Config.maxZoom * base.height / frame.height,
+                        visible.width / frame.width, visible.height / frame.height)
+        guard upper >= lower else { return frame }
+        let f = min(max(factor, lower), upper)
+        guard f != 1 else { return frame }
+
+        var out = CGRect(x: anchor.x - (anchor.x - frame.minX) * f,
+                         y: anchor.y - (anchor.y - frame.minY) * f,
+                         width: frame.width * f, height: frame.height * f)
+        // 贴着屏幕边缘放大时窗口会探出屏幕，整体平移回来（平移不改变倍率）。
+        if out.width <= visible.width { out.origin.x = min(max(out.minX, visible.minX), visible.maxX - out.width) }
+        else { out.origin.x = visible.midX - out.width / 2 }
+        if out.height <= visible.height { out.origin.y = min(max(out.minY, visible.minY), visible.maxY - out.height) }
+        else { out.origin.y = visible.midY - out.height / 2 }
+        return out
+    }
+}
+
 // MARK: - 小窗
 
 final class PinPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+
+    /// 滚轮是投递到"鼠标下方的视图"的，捏合却走 first responder 链；
+    /// 小窗是 nonactivating 面板，平时既不是 key 也没有 first responder，捏合事件就半路丢了。
+    /// 所以在窗口这一层直接转给内容视图，不要求用户先点一下小窗。
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .magnify, let root = contentView as? PinRootView {
+            root.magnify(with: event)
+            return
+        }
+        super.sendEvent(event)
+    }
 }
 
 final class PinRootView: NSView {
@@ -230,6 +279,18 @@ final class PinRootView: NSView {
     private let closeButton = NSButton(title: "✕", target: nil, action: nil)
 
     var onClose: (() -> Void)?
+    /// 刚钉住时的尺寸，缩放倍率的基准由它算出。
+    var baseSize: CGSize = .zero
+    /// 聚焦状态。键盘事件只发给 key 窗口，所以得让用户看得出当前按 Esc 关掉的是哪一个。
+    var isFocused = false {
+        didSet {
+            guard isFocused != oldValue else { return }
+            layer?.borderWidth = isFocused ? Self.focusRing : 0
+            layer?.borderColor = NSColor.controlAccentColor.cgColor
+            needsLayout = true
+        }
+    }
+    private static let focusRing: CGFloat = 2
     private var tracking: NSTrackingArea?
     private var edge: Edge?
     private var dragStart = CGPoint.zero
@@ -276,7 +337,8 @@ final class PinRootView: NSView {
 
     override func layout() {
         super.layout()
-        displayLayer.frame = bounds
+        // 画面层要留出亮边的宽度，否则会把它整个盖住。
+        displayLayer.frame = isFocused ? bounds.insetBy(dx: Self.focusRing, dy: Self.focusRing) : bounds
         closeButton.frame = CGRect(x: bounds.maxX - 20, y: bounds.maxY - 18, width: 20, height: 18)
         statusLabel.frame = CGRect(x: 0, y: bounds.midY - 9, width: bounds.width, height: 18)
     }
@@ -313,6 +375,10 @@ final class PinRootView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if closeButton.frame.contains(point) { closeTapped(); return }
+        // nonactivating 面板不会自动被点成 key 窗口，而键盘事件只发给 key 窗口的 first responder，
+        // 所以点一下小窗时显式聚焦，Esc / ⌘W 才有地方收。
+        window?.makeKey()
+        window?.makeFirstResponder(self)
         let hit = edge(at: point)
         guard !hit.isEmpty, let window else { super.mouseDown(with: event); return }
         edge = hit
@@ -346,7 +412,38 @@ final class PinRootView: NSView {
         super.mouseUp(with: event)
     }
 
+    /// 触摸板双指捏合。magnification 是相对上一个事件的增量（头文件：加到当前缩放系数上），
+    /// 这里当作倍率增量连乘到当前 frame，所以手势中途也不会跳。
+    override func magnify(with event: NSEvent) {
+        zoom(by: 1 + event.magnification, windowPoint: event.locationInWindow)
+    }
+
+    /// 滚轮放在小窗上直接缩放，不需要按住修饰键。
+    /// 约定朝上滚 = 放大；如果实测方向反了，改 PinScale.wheelStep 的正负号即可。
+    override func scrollWheel(with event: NSEvent) {
+        let delta = event.deltaY
+        guard delta != 0 else { super.scrollWheel(with: event); return }
+        let step: CGFloat = event.hasPreciseScrollingDeltas ? PinScale.trackpadStep : PinScale.wheelStep
+        zoom(by: exp2(delta * step), windowPoint: event.locationInWindow)
+    }
+
+    private func zoom(by factor: CGFloat, windowPoint: CGPoint?) {
+        guard let window, factor != 1 else { return }
+        let anchor = windowPoint.map { window.convertPoint(toScreen: $0) } ?? NSEvent.mouseLocation
+        let visible = window.screen?.visibleFrame ?? NSScreen.main?.frame ?? window.frame
+        let next = PinScale.zoomed(window.frame, by: factor, anchor: anchor, base: baseSize, visible: visible)
+        guard next != window.frame else { return }
+        window.setFrame(next, display: true)
+    }
+
+    /// 普通 NSView 默认不接受键盘焦点，不打开它 keyDown 收不到 Esc / ⌘W。
+    override var acceptsFirstResponder: Bool { true }
+
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == UInt16(kVK_Escape) {
+            closeTapped()
+            return
+        }
         if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "w" {
             closeTapped()
             return
@@ -391,8 +488,10 @@ final class Pin: NSObject, NSWindowDelegate {
         panel.isOpaque = true
         panel.backgroundColor = .black
         panel.delegate = self
+        panel.initialFirstResponder = root
         panel.setFrame(frameOrigin(target: target), display: false)
 
+        root.baseSize = target.crop.size
         root.onClose = { [weak self] in self?.close() }
         capture.onFrame = { [weak self] buffer in self?.handle(buffer) }
         capture.onStopped = { [weak self] in self?.markStale() }
@@ -468,6 +567,13 @@ final class Pin: NSObject, NSWindowDelegate {
     func windowDidChangeOcclusionState(_ notification: Notification) {
         capture.setVisible(panel.occlusionState.contains(.visible))
     }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        panel.makeFirstResponder(root)
+        root.isFocused = true
+    }
+
+    func windowDidResignKey(_ notification: Notification) { root.isFocused = false }
 }
 
 // MARK: - 框选遮罩
@@ -547,6 +653,38 @@ final class SelectionWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 }
 
+// MARK: - 全局快捷键
+
+/// 用 Carbon 热键而不是事件监听：Carbon 不额外要"辅助功能"授权就能全局收键。
+/// 代价是修饰键只认 command/option/control/shift，没有 Fn——但 Apple 键盘默认把 F1/F2 当亮度键，
+/// 按住 fn 才发出真正的 F2 键码，所以注册"无修饰键的 F2"，按 fn+F2 正好触发。
+/// （如果系统设置里勾了"将 F1、F2 等键用作标准功能键"，单按 F2 也会触发。）
+enum HotKey {
+    private static let keycode = UInt32(kVK_F2)
+    private static let modifiers = UInt32(0)
+    private static var registration: EventHotKeyRef?
+
+    static var onPress: (() -> Void)?
+
+    @discardableResult
+    static func install() -> Bool {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetEventDispatcherTarget(), hotKeyFired, 1, &spec, nil, nil)
+        var ref: EventHotKeyRef?
+        let id = EventHotKeyID(signature: OSType(0x5350494E), id: 1)   // 'SPIN'
+        guard RegisterEventHotKey(keycode, modifiers, id, GetEventDispatcherTarget(), 0, &ref) == noErr,
+              let ref else { return false }
+        registration = ref
+        return true
+    }
+}
+
+/// Carbon 的回调不能捕获上下文，动作挂在 HotKey.onPress 上；它由主线程事件循环派发。
+private func hotKeyFired(_ call: EventHandlerCallRef?, _ event: EventRef?, _ userData: UnsafeMutableRawPointer?) -> OSStatus {
+    HotKey.onPress?()
+    return noErr
+}
+
 // MARK: - 主控制器
 
 final class AppController: NSObject, NSApplicationDelegate {
@@ -567,7 +705,10 @@ final class AppController: NSObject, NSApplicationDelegate {
             image?.isTemplate = true
             button.image = image
         }
-        statusItem.menu = buildMenu()
+        HotKey.onPress = { [weak self] in self?.beginSelection() }
+        let hotKeyReady = HotKey.install()
+        statusItem.menu = buildMenu(hotKeyReady: hotKeyReady)
+        if !hotKeyReady { flash("fn+F2 注册失败") }
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         say("已启动。菜单栏图标 = 图钉")
@@ -577,9 +718,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func buildMenu() -> NSMenu {
+    private func buildMenu(hotKeyReady: Bool) -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(withTitle: "框选新区域", action: #selector(beginSelection), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "框选新区域" + (hotKeyReady ? "    fn+F2" : ""),
+                     action: #selector(beginSelection), keyEquivalent: "").target = self
         menu.addItem(withTitle: "关闭全部小窗", action: #selector(closeAll), keyEquivalent: "").target = self
         menu.addItem(withTitle: "重新申请屏幕录制权限", action: #selector(requestPermission), keyEquivalent: "").target = self
         menu.addItem(.separator())
