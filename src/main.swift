@@ -282,6 +282,8 @@ final class PinRootView: NSView {
     private let closeButton = NSButton(title: "✕", target: nil, action: nil)
 
     var onClose: (() -> Void)?
+    /// 双击小窗时跳回源 App。
+    var onReveal: (() -> Void)?
     /// 刚钉住时的尺寸，缩放倍率的基准由它算出。
     var baseSize: CGSize = .zero
     /// 相对 baseSize 的倍率。尺寸一律由 baseSize × 倍率得出，不从当前 frame 反推。
@@ -353,6 +355,9 @@ final class PinRootView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         if closeButton.frame.contains(convert(event.locationInWindow, from: nil)) { closeTapped(); return }
+        // 双击的判定靠第二下的 clickCount == 2；这里直接返回，不再往下走拖动，
+        // 否则跳回源 App 的同时还会顺手把小窗拽偏一点。
+        if event.clickCount >= 2 { onReveal?(); return }
         // nonactivating 面板不会自动被点成 key 窗口，而键盘事件只发给 key 窗口的 first responder，
         // 所以点一下小窗时显式聚焦，Esc / ⌘W 才有地方收。
         window?.makeKey()
@@ -452,6 +457,7 @@ final class Pin: NSObject, NSWindowDelegate {
 
         root.baseSize = target.crop.size
         root.onClose = { [weak self] in self?.close() }
+        root.onReveal = { [weak self] in self?.revealSource() }
         capture.onFrame = { [weak self] buffer in self?.handle(buffer) }
         capture.onStopped = { [weak self] in self?.markStale() }
         watchdog = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.checkStale() }
@@ -512,6 +518,21 @@ final class Pin: NSObject, NSWindowDelegate {
             await self.capture.stop()
             try? await self.capture.start(target: next)
         }
+    }
+
+    /// 双击小窗跳回源 App：把它调到前台，屏幕焦点回到原来那块内容所在的软件上。
+    /// 走 NSRunningApplication 而不是 Accessibility API，后者要额外申请"辅助功能"授权，
+    /// 为一个跳转动作多要一个权限不值得。
+    /// 命中选区中心时取的就是那个位置最靠前的普通层窗口，所以把该 App 调到前台后，
+    /// 露出来的正是当初框住的那一页。
+    private func revealSource() {
+        let pid = target.window.owningApplication?.processID ?? 0
+        guard pid > 0, let app = NSRunningApplication(processIdentifier: pid) else {
+            say("跳转失败：源 App 已退出（pid \(pid)）")
+            return
+        }
+        if app.isHidden { app.unhide() }
+        app.activate(options: [])
     }
 
     func close() {
